@@ -1,0 +1,11 @@
+# Never ship these into the image
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.DS_Store
+README.md
+DEPLOY.md

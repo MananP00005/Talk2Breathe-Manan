@@ -1,0 +1,21 @@
+# Talk2Breath — one-command Docker deployment.
+# Builds from the Dockerfile and runs the app, reading keys from .env.
+#
+# Usage on the server (inside the project folder):
+#   docker compose up -d --build      # build + start in the background
+#   docker compose logs -f            # watch logs
+#   docker compose down               # stop and remove
+#   docker compose up -d --build      # re-run after a git pull to update
+#
+services:
+  talk2breath:
+    build: .
+    container_name: talk2breath
+    restart: unless-stopped
+    ports:
+      # host_port:container_port  -> visitors reach the app on port 80 (plain http)
+      - "80:8080"
+    env_file:
+      - .env          # provides GROQ_API_KEYS (and optional model overrides)
+    environment:
+      - PORT=8080     # the port uvicorn listens on inside the container
