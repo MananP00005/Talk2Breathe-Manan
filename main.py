@@ -32,6 +32,9 @@ FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
 VISION_MODEL = os.getenv(
     "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
 )
+# Speech-to-text (voice messages) — works in every browser, more accurate than the
+# browser's built-in recognition.
+STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 
 
 class OutOfTokens(Exception):
@@ -211,6 +214,26 @@ def groq_chat(messages, max_tokens=400):
     return groq_complete(messages, (TEXT_MODEL, FALLBACK_MODEL), max_tokens)
 
 
+def groq_transcribe(filename, raw_bytes):
+    """Turn a recorded voice clip into text using Groq Whisper, rotating keys."""
+    clients = get_clients()
+    for i, client in enumerate(clients, start=1):
+        try:
+            result = client.audio.transcriptions.create(
+                file=(filename, raw_bytes),
+                model=STT_MODEL,
+                temperature=0,
+            )
+            return result.text.strip()
+        except RateLimitError:
+            print(f"[rate-limited] key #{i} / whisper is out of tokens, trying next...")
+            continue
+        except AuthenticationError:
+            print(f"[bad key] key #{i} rejected — skipping.")
+            continue
+    raise OutOfTokens()
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """Text chat with Breezy."""
@@ -285,6 +308,48 @@ async def chat_image(
         return JSONResponse(
             status_code=500,
             content={"error": "Breezy couldn't see the picture. Please try again! 🖼️",
+                     "detail": str(e)},
+        )
+
+
+@app.post("/api/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    """Turn a recorded voice clip into text (Groq Whisper). Works in all browsers."""
+    try:
+        raw = await audio.read()
+        if len(raw) > 25 * 1024 * 1024:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "That voice message is too long! Try a shorter one. 🎤"},
+            )
+        # Give Groq a filename with the right extension so it detects the format.
+        ct = (audio.content_type or "").lower()
+        if "mp4" in ct or "m4a" in ct:
+            ext = "mp4"
+        elif "ogg" in ct:
+            ext = "ogg"
+        elif "wav" in ct:
+            ext = "wav"
+        elif "mpeg" in ct or "mp3" in ct:
+            ext = "mp3"
+        else:
+            ext = "webm"
+        text = groq_transcribe(f"audio.{ext}", raw)
+        return {"text": text}
+    except OutOfTokens:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Breezy's ears need a little rest! 😴 Please try again later."},
+        )
+    except RuntimeError as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+    except Exception as e:
+        print("\n=== TRANSCRIBE ERROR ===")
+        traceback.print_exc()
+        print("========================\n")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "I couldn't hear that clearly. Please try again! 🎤",
                      "detail": str(e)},
         )
 

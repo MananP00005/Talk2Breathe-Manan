@@ -212,60 +212,83 @@ function clearImage() {
 }
 clearImgBtn.addEventListener("click", clearImage);
 
-/* ---------- Speech to Text (mic, optional & free) ---------- */
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let recog = null;
-let isListening = false;
+/* ---------- Voice messages: record audio -> Groq Whisper (works in all browsers) ---------- */
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
 
-if (SR) {
-  recog = new SR();
-  recog.lang = "en-US";
-  recog.continuous = false;      // one phrase at a time (prevents runaway loops)
-  recog.interimResults = false;  // only final text
-  recog.maxAlternatives = 1;
+micBtn.addEventListener("click", async () => {
+  if (isBusy) return;
+  if (isRecording) { stopRecording(); return; }  // tap again to stop & send
 
-  recog.onresult = (ev) => {
-    // Take only the LAST final result, once.
-    const last = ev.results[ev.results.length - 1];
-    if (!last || !last.isFinal) return;
-    const said = (last[0].transcript || "").trim();
-    stopListening();
-    // Put the heard words in the box so the child can check/fix them
-    // (voice recognition sometimes mishears, e.g. "vape" -> "wave") then press send.
-    if (said) {
-      messageInput.value = said;
-      messageInput.focus();
-    }
-  };
-  recog.onend = () => stopListening();
-  recog.onerror = () => stopListening();
+  // The microphone only works on a secure (https) page — or on localhost.
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    addMessage(
+      "To talk to me with your voice, this page needs a secure (https) connection. 🌬️ " +
+      "It works on a computer, and on phones once the site is on https. For now, you can type to me! 😊",
+      "bot"
+    );
+    return;
+  }
 
-  micBtn.addEventListener("click", () => {
-    if (isBusy) return;                 // don't listen while a reply is loading
-    if (isListening) { stopListening(); return; }  // tap again to stop
-    window.speechSynthesis.cancel();    // silence Breezy so the mic can't hear it
-    startListening();
-  });
-} else {
-  micBtn.style.display = "none"; // browser doesn't support it
-}
-
-function startListening() {
-  if (!recog || isListening) return;
   try {
-    recog.start();
-    isListening = true;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());  // release the mic
+      handleRecording();
+    };
+    window.speechSynthesis.cancel();  // stop Breezy talking while recording
+    mediaRecorder.start();
+    isRecording = true;
     micBtn.classList.add("listening");
   } catch (e) {
-    isListening = false;
+    addMessage("I couldn't reach the microphone. Please allow mic access and try again. 🎤", "bot");
+  }
+});
+
+function stopRecording() {
+  if (mediaRecorder && isRecording) {
+    isRecording = false;
     micBtn.classList.remove("listening");
+    try { mediaRecorder.stop(); } catch (e) {}
   }
 }
-function stopListening() {
-  if (!recog) return;
-  isListening = false;
-  micBtn.classList.remove("listening");
-  try { recog.stop(); } catch (e) {}
+
+async function handleRecording() {
+  const type = (mediaRecorder && mediaRecorder.mimeType) || "audio/webm";
+  const blob = new Blob(audioChunks, { type });
+  if (!blob.size) return;
+
+  let ext = "webm";
+  if (type.includes("mp4") || type.includes("m4a")) ext = "mp4";
+  else if (type.includes("ogg")) ext = "ogg";
+  else if (type.includes("wav")) ext = "wav";
+
+  const form = new FormData();
+  form.append("audio", blob, "audio." + ext);
+
+  const oldPlaceholder = messageInput.placeholder;
+  messageInput.placeholder = "✍️ Turning your voice into words…";
+  micBtn.disabled = true;
+  try {
+    const res = await fetch("/api/transcribe", { method: "POST", body: form });
+    const data = await res.json();
+    if (data.text) {
+      // Put the words in the box so the child can check/fix them, then press send.
+      messageInput.value = data.text;
+      messageInput.focus();
+    } else {
+      addMessage(data.error || "I couldn't hear that clearly. Please try again! 🎤", "bot");
+    }
+  } catch (e) {
+    addMessage("Voice isn't working right now — please type to me instead! 🎤", "bot");
+  } finally {
+    messageInput.placeholder = oldPlaceholder;
+    micBtn.disabled = false;
+  }
 }
 
 /* ---------- Tap a drawing to see it bigger ---------- */
