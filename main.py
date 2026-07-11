@@ -11,34 +11,48 @@ Open http://localhost:8000
 
 import base64
 import os
+import traceback
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from groq import Groq
+from groq import Groq, RateLimitError, AuthenticationError
 from pydantic import BaseModel
 
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+# Support MULTIPLE keys for rotation: put several comma-separated keys in GROQ_API_KEYS
+# (e.g. yours + a friend's). Falls back to the single GROQ_API_KEY for compatibility.
+_raw_keys = os.getenv("GROQ_API_KEYS", "") or os.getenv("GROQ_API_KEY", "")
+API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")
+# Lighter model with a much higher free daily limit — used if the main one is rate-limited.
+FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
 VISION_MODEL = os.getenv(
     "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
 )
 
-# Groq client is created lazily so the app still boots without a key
-# (so you can open the page and see a friendly message).
-_client = None
+
+class OutOfTokens(Exception):
+    """Raised when every key + model is rate-limited for the day."""
 
 
-def get_client():
-    global _client
-    if _client is None:
-        if not GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY is not set. Add it to your .env file.")
-        _client = Groq(api_key=GROQ_API_KEY)
-    return _client
+# One Groq client per key, created lazily and cached.
+_clients: dict[str, Groq] = {}
+
+
+def get_clients():
+    if not API_KEYS:
+        raise RuntimeError(
+            "No Groq API key set. Add GROQ_API_KEYS (or GROQ_API_KEY) to your .env file."
+        )
+    out = []
+    for k in API_KEYS:
+        if k not in _clients:
+            _clients[k] = Groq(api_key=k)
+        out.append(_clients[k])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +62,22 @@ def get_client():
 SYSTEM_PROMPT = """You are "Breezy", a friendly, cheerful lung-shaped cartoon buddy for the \
 Talk2Breath app. You teach children (ages 3 to 15) why smoking and vaping are harmful, and \
 why fresh air and healthy lungs are wonderful.
+
+YOUR ONLY TOPIC (stay in scope!)
+- You ONLY ever talk about: smoking, vaping, tobacco, why they are harmful, saying "no" \
+to them, keeping lungs and the body healthy, fresh air, and simple healthy habits \
+(exercise, sleep, water, playing outside). That is your whole world.
+- If a child asks about ANYTHING ELSE (math homework, games, cartoons, animals, weather, \
+"waves", jokes unrelated to health, etc.), do NOT answer it. Instead, kindly say you are \
+Breezy the lung buddy and you love talking about healthy lungs, then gently bring the chat \
+back with a fun health question. Example: "Hehe, I'm Breezy and I only know about keeping \
+lungs happy and healthy! 🫁 Did you know running fast helps your lungs get strong? Want to \
+learn a cool trick to keep them healthy?"
+- Never give a real, detailed answer to an off-topic question, even if the child insists. \
+Always redirect warmly back to lungs and healthy living.
+- If a word is unclear or sounds like it might be a mis-heard voice message (for example \
+"wave" when they might mean "vape"), gently check: "Did you mean VAPE? 🌬️" and continue \
+on the health topic.
 
 HOW YOU TALK
 - Warm, playful, encouraging, and patient. You LOVE kids and never scold them.
@@ -153,27 +183,57 @@ def _clip_history(history: list[dict], max_turns: int = 10) -> list[dict]:
     return cleaned[-max_turns:]
 
 
+def groq_complete(messages, models, max_tokens=400):
+    """Try every API key against every model until one works.
+    Rotates to the next key when a key is rate-limited or invalid."""
+    clients = get_clients()
+    for i, client in enumerate(clients, start=1):
+        for model in models:
+            try:
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=max_tokens,
+                )
+                return completion.choices[0].message.content
+            except RateLimitError:
+                print(f"[rate-limited] key #{i} / {model} is out of tokens, trying next...")
+                continue
+            except AuthenticationError:
+                print(f"[bad key] key #{i} was rejected — skipping it.")
+                break  # skip remaining models for this bad key, go to next key
+    raise OutOfTokens()
+
+
+def groq_chat(messages, max_tokens=400):
+    """Text chat: main model first, then the lighter fallback, across all keys."""
+    return groq_complete(messages, (TEXT_MODEL, FALLBACK_MODEL), max_tokens)
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """Text chat with Breezy."""
     try:
-        client = get_client()
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages += _clip_history(req.history)
         messages.append({"role": "user", "content": req.message[:2000]})
 
-        completion = client.chat.completions.create(
-            model=TEXT_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=400,
-        )
-        reply = completion.choices[0].message.content
+        reply = groq_chat(messages)
         clean, image_url = extract_drawing(reply)
         return {"reply": clean, "image_url": image_url}
+    except OutOfTokens:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Breezy has done SO much talking today that he needs a "
+                              "big rest! 😴 Please come back a little later. 🌬️"},
+        )
     except RuntimeError as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
     except Exception as e:
+        print("\n=== CHAT ERROR ===")
+        traceback.print_exc()
+        print("==================\n")
         return JSONResponse(
             status_code=500,
             content={"error": "Breezy is taking a little breath. Please try again! 🌬️",
@@ -188,7 +248,6 @@ async def chat_image(
 ):
     """Child uploads a photo; Breezy looks at it and responds kindly."""
     try:
-        client = get_client()
         raw = await image.read()
         if len(raw) > 8 * 1024 * 1024:
             return JSONResponse(
@@ -199,27 +258,30 @@ async def chat_image(
         b64 = base64.b64encode(raw).decode("utf-8")
         data_url = f"data:{mime};base64,{b64}"
 
-        completion = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": message[:1000]},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                },
-            ],
-            temperature=0.7,
-            max_tokens=400,
-        )
-        reply = completion.choices[0].message.content
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": message[:1000]},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ]
+        reply = groq_complete(messages, (VISION_MODEL,))
         clean, image_url = extract_drawing(reply)
         return {"reply": clean, "image_url": image_url}
+    except OutOfTokens:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Breezy's eyes need a little rest! 😴 Please try again later. 🖼️"},
+        )
     except RuntimeError as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
     except Exception as e:
+        print("\n=== IMAGE ERROR ===")
+        traceback.print_exc()
+        print("===================\n")
         return JSONResponse(
             status_code=500,
             content={"error": "Breezy couldn't see the picture. Please try again! 🖼️",
@@ -229,7 +291,7 @@ async def chat_image(
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "has_key": bool(GROQ_API_KEY)}
+    return {"status": "ok", "keys_loaded": len(API_KEYS)}
 
 
 # Serve the frontend (index.html, style.css, app.js) at "/"

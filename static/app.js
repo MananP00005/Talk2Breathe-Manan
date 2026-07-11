@@ -15,6 +15,14 @@ const chips = document.getElementById("chips");
 let history = []; // {role, content}
 let pendingImage = null;
 let ttsOn = true;
+let isBusy = false; // lock: only one message in flight at a time
+
+function setBusy(state) {
+  isBusy = state;
+  document.getElementById("sendBtn").disabled = state;
+  micBtn.disabled = state;
+  micBtn.style.opacity = state ? 0.5 : 1;
+}
 
 /* ---------- Message rendering ---------- */
 function addMessage(text, who, imageDataUrl) {
@@ -100,6 +108,9 @@ ttsToggle.addEventListener("click", () => {
 
 /* ---------- Sending messages ---------- */
 async function sendText(text) {
+  if (isBusy || !text) return;      // ignore while a message is already sending
+  setBusy(true);
+  window.speechSynthesis.cancel();  // stop any current speech before new turn
   addMessage(text, "user");
   history.push({ role: "user", content: text });
   showTyping();
@@ -119,10 +130,15 @@ async function sendText(text) {
   } catch (e) {
     hideTyping();
     addMessage("Breezy lost the breeze for a second! Please try again. 🌬️", "bot");
+  } finally {
+    setBusy(false);
   }
 }
 
 async function sendImage(file, caption) {
+  if (isBusy) return;
+  setBusy(true);
+  window.speechSynthesis.cancel();
   const dataUrl = await fileToDataUrl(file);
   addMessage(caption || "Look at this! 📷", "user", dataUrl);
   showTyping();
@@ -144,6 +160,8 @@ async function sendImage(file, caption) {
   } catch (e) {
     hideTyping();
     addMessage("Breezy couldn't peek at the picture. Try again! 🖼️", "bot");
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -197,26 +215,57 @@ clearImgBtn.addEventListener("click", clearImage);
 /* ---------- Speech to Text (mic, optional & free) ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recog = null;
+let isListening = false;
+
 if (SR) {
   recog = new SR();
   recog.lang = "en-US";
-  recog.interimResults = false;
+  recog.continuous = false;      // one phrase at a time (prevents runaway loops)
+  recog.interimResults = false;  // only final text
+  recog.maxAlternatives = 1;
+
   recog.onresult = (ev) => {
-    const said = ev.results[0][0].transcript;
-    messageInput.value = said;
-    micBtn.classList.remove("listening");
-    sendText(said);
-    messageInput.value = "";
+    // Take only the LAST final result, once.
+    const last = ev.results[ev.results.length - 1];
+    if (!last || !last.isFinal) return;
+    const said = (last[0].transcript || "").trim();
+    stopListening();
+    // Put the heard words in the box so the child can check/fix them
+    // (voice recognition sometimes mishears, e.g. "vape" -> "wave") then press send.
+    if (said) {
+      messageInput.value = said;
+      messageInput.focus();
+    }
   };
-  recog.onend = () => micBtn.classList.remove("listening");
-  recog.onerror = () => micBtn.classList.remove("listening");
+  recog.onend = () => stopListening();
+  recog.onerror = () => stopListening();
+
   micBtn.addEventListener("click", () => {
-    window.speechSynthesis.cancel();
-    micBtn.classList.add("listening");
-    try { recog.start(); } catch (e) { micBtn.classList.remove("listening"); }
+    if (isBusy) return;                 // don't listen while a reply is loading
+    if (isListening) { stopListening(); return; }  // tap again to stop
+    window.speechSynthesis.cancel();    // silence Breezy so the mic can't hear it
+    startListening();
   });
 } else {
   micBtn.style.display = "none"; // browser doesn't support it
+}
+
+function startListening() {
+  if (!recog || isListening) return;
+  try {
+    recog.start();
+    isListening = true;
+    micBtn.classList.add("listening");
+  } catch (e) {
+    isListening = false;
+    micBtn.classList.remove("listening");
+  }
+}
+function stopListening() {
+  if (!recog) return;
+  isListening = false;
+  micBtn.classList.remove("listening");
+  try { recog.stop(); } catch (e) {}
 }
 
 /* ---------- Tap a drawing to see it bigger ---------- */
