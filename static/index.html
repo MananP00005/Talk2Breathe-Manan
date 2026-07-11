@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Talk2Breath 🌬️ — Breezy the Lung Buddy</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Nunito:wght@400;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Floating background bubbles -->
+  <div class="bubbles" aria-hidden="true">
+    <span></span><span></span><span></span><span></span><span></span><span></span>
+  </div>
+
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mascot" id="mascot">🫁</div>
+        <div class="brand-text">
+          <h1>Talk2Breath</h1>
+          <p>Chat with <strong>Breezy</strong>, your lung buddy!</p>
+        </div>
+      </div>
+      <button id="ttsToggle" class="tts-toggle on" title="Turn Breezy's voice on/off">
+        <span class="tts-icon">🔊</span><span class="tts-label">Voice On</span>
+      </button>
+    </header>
+
+    <main id="chat" class="chat" aria-live="polite"></main>
+
+    <!-- Quick-tap suggestion chips for little ones -->
+    <div class="chips" id="chips">
+      <button class="chip" data-say="Why is smoking bad for me?">Why is smoking bad? 🚭</button>
+      <button class="chip" data-say="How do I keep my lungs healthy?">Keep lungs healthy 🫁</button>
+      <button class="chip" data-say="What should I say if someone offers me a cigarette?">Say no thank you 🙅</button>
+      <button class="chip" data-say="Tell me a fun fact about my body!">Fun body fact 🌟</button>
+      <button class="chip" data-say="Can you draw me a picture of happy healthy lungs?">Draw me a picture 🎨</button>
+    </div>
+
+    <form id="composer" class="composer" autocomplete="off">
+      <label class="icon-btn upload-btn" title="Send a picture">
+        📷
+        <input type="file" id="imageInput" accept="image/*" hidden />
+      </label>
+      <button type="button" id="micBtn" class="icon-btn" title="Talk to Breezy">🎤</button>
+      <input type="text" id="messageInput" placeholder="Type a message to Breezy…" maxlength="500" />
+      <button type="submit" id="sendBtn" class="icon-btn send" title="Send">➤</button>
+    </form>
+
+    <div id="imgPreview" class="img-preview hidden">
+      <img id="previewImg" alt="Your picture" />
+      <button id="clearImg" class="clear-img" title="Remove picture">✖</button>
+      <span>Picture ready! Add a message or just press send.</span>
+    </div>
+  </div>
+
+  <!-- Full-screen picture viewer (tap a drawing to enlarge) -->
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-label="Big picture">
+    <button class="lightbox-close" id="lightboxClose" title="Close">✖</button>
+    <img id="lightboxImg" alt="Big picture from Breezy" />
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
