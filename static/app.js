@@ -1,5 +1,54 @@
 /* Talk2Breath — Breezy the Lung Buddy (frontend logic) */
 
+const idGate = document.getElementById("idGate");
+const idGateForm = document.getElementById("idGateForm");
+const participantIdInput = document.getElementById("participantIdInput");
+const idGateError = document.getElementById("idGateError");
+const idGateSubmit = document.getElementById("idGateSubmit");
+const appRoot = document.getElementById("appRoot");
+
+let participantId = null;
+
+/* ---------- Participant ID gate ---------- */
+// Every session (including re-opening the browser) requires the ID again, on purpose:
+// re-entering the same ID appends to that participant's existing transcript on the
+// server, so an accidental close/crash never loses the research recording.
+idGateForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const id = participantIdInput.value.trim();
+  idGateError.classList.add("hidden");
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+    idGateError.textContent = "Please use only letters, numbers, - or _ (1-64 characters).";
+    idGateError.classList.remove("hidden");
+    return;
+  }
+  idGateSubmit.disabled = true;
+  idGateSubmit.textContent = "Starting…";
+  try {
+    const res = await fetch("/api/session/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ participant_id: id }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      idGateError.textContent = data.error || "Couldn't start the session. Please try again.";
+      idGateError.classList.remove("hidden");
+      return;
+    }
+    participantId = data.participant_id;
+    idGate.classList.add("hidden");
+    appRoot.classList.remove("hidden");
+    startChat();
+  } catch (e) {
+    idGateError.textContent = "Couldn't reach Breezy. Please check your connection and try again.";
+    idGateError.classList.remove("hidden");
+  } finally {
+    idGateSubmit.disabled = false;
+    idGateSubmit.textContent = "Start Chatting 🌬️";
+  }
+});
+
 const chat = document.getElementById("chat");
 const composer = document.getElementById("composer");
 const messageInput = document.getElementById("messageInput");
@@ -67,7 +116,24 @@ function hideTyping() {
   if (t) t.remove();
 }
 
-/* ---------- Text to Speech (Web Speech API, free) ---------- */
+/* ---------- Text to Speech ----------
+   Breezy's voice is generated on the SERVER (Groq TTS) and played back with a plain
+   <audio> element — that works identically on every tablet/browser, unlike the
+   browser's built-in speechSynthesis, which is missing or broken on many Android
+   tablets and kiosk/in-app browsers. If the server voice can't be reached (offline,
+   rate-limited), we fall back to the browser's own speech engine when available, so
+   voice degrades gracefully instead of just failing silently. */
+let currentAudio = null;
+
+function stopSpeaking() {
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio = null;
+  }
+  mascot.classList.remove("talking");
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+}
+
 function pickVoice() {
   const voices = window.speechSynthesis.getVoices();
   // Prefer a friendly English voice; many browsers have a female/child-ish default.
@@ -77,12 +143,8 @@ function pickVoice() {
   return preferred;
 }
 
-function speak(text) {
-  if (!ttsOn || !("speechSynthesis" in window)) return;
-  window.speechSynthesis.cancel();
-  // Strip emojis so the voice doesn't read them awkwardly.
-  const clean = text.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "").trim();
-  if (!clean) return;
+function speakWithBrowserFallback(clean) {
+  if (!("speechSynthesis" in window)) return;
   const u = new SpeechSynthesisUtterance(clean);
   const v = pickVoice();
   if (v) u.voice = v;
@@ -97,20 +159,46 @@ if ("speechSynthesis" in window) {
   window.speechSynthesis.onvoiceschanged = pickVoice;
 }
 
+async function speak(text) {
+  if (!ttsOn) return;
+  stopSpeaking();
+  // Strip emojis so the voice doesn't read them awkwardly.
+  const clean = text.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "").trim();
+  if (!clean) return;
+  try {
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: clean }),
+    });
+    if (!res.ok) throw new Error("tts failed");
+    const data = await res.json();
+    if (!data.audio_url) throw new Error("no audio");
+    const audio = new Audio(data.audio_url);
+    currentAudio = audio;
+    audio.onplay = () => mascot.classList.add("talking");
+    audio.onended = () => mascot.classList.remove("talking");
+    audio.onerror = () => { mascot.classList.remove("talking"); speakWithBrowserFallback(clean); };
+    await audio.play();
+  } catch (e) {
+    speakWithBrowserFallback(clean);
+  }
+}
+
 ttsToggle.addEventListener("click", () => {
   ttsOn = !ttsOn;
   ttsToggle.classList.toggle("on", ttsOn);
   ttsToggle.classList.toggle("off", !ttsOn);
   ttsToggle.querySelector(".tts-icon").textContent = ttsOn ? "🔊" : "🔇";
   ttsToggle.querySelector(".tts-label").textContent = ttsOn ? "Voice On" : "Voice Off";
-  if (!ttsOn) window.speechSynthesis.cancel();
+  if (!ttsOn) stopSpeaking();
 });
 
 /* ---------- Sending messages ---------- */
 async function sendText(text) {
   if (isBusy || !text) return;      // ignore while a message is already sending
   setBusy(true);
-  window.speechSynthesis.cancel();  // stop any current speech before new turn
+  stopSpeaking();  // stop any current speech before new turn
   addMessage(text, "user");
   history.push({ role: "user", content: text });
   showTyping();
@@ -118,7 +206,7 @@ async function sendText(text) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, history: history.slice(0, -1) }),
+      body: JSON.stringify({ message: text, history: history.slice(0, -1), participant_id: participantId }),
     });
     const data = await res.json();
     hideTyping();
@@ -138,7 +226,7 @@ async function sendText(text) {
 async function sendImage(file, caption) {
   if (isBusy) return;
   setBusy(true);
-  window.speechSynthesis.cancel();
+  stopSpeaking();
   const dataUrl = await fileToDataUrl(file);
   addMessage(caption || "Look at this! 📷", "user", dataUrl);
   showTyping();
@@ -146,6 +234,7 @@ async function sendImage(file, caption) {
     const form = new FormData();
     form.append("image", file);
     form.append("message", caption || "What is in this picture?");
+    form.append("participant_id", participantId || "");
     const res = await fetch("/api/chat-image", { method: "POST", body: form });
     const data = await res.json();
     hideTyping();
@@ -240,7 +329,7 @@ micBtn.addEventListener("click", async () => {
       stream.getTracks().forEach((t) => t.stop());  // release the mic
       handleRecording();
     };
-    window.speechSynthesis.cancel();  // stop Breezy talking while recording
+    stopSpeaking();  // stop Breezy talking while recording
     mediaRecorder.start();
     isRecording = true;
     micBtn.classList.add("listening");
@@ -312,9 +401,11 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* ---------- Welcome message ---------- */
-window.addEventListener("load", () => {
+// Runs once the participant ID has been accepted (see the idGateForm handler above),
+// not on page load — the chat itself only starts after that gate is passed.
+function startChat() {
   const hello = "Hi there! I'm Breezy, your lung buddy! I love clean air and healthy lungs. Ask me anything, or tap a bubble below to start! 🌬️😊";
   addMessage(hello, "bot");
   // Some browsers block auto-speech until the user interacts; that's fine.
   setTimeout(() => speak(hello), 400);
-});
+}

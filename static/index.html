@@ -6,7 +6,7 @@
   <title>Talk2Breath 🌬️ — Breezy the Lung Buddy</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Nunito:wght@400;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=2" />
+  <link rel="stylesheet" href="style.css?v=3" />
 </head>
 <body>
   <!-- Floating background bubbles -->
@@ -14,7 +14,19 @@
     <span></span><span></span><span></span><span></span><span></span><span></span>
   </div>
 
-  <div class="app">
+  <!-- Participant ID gate — must be entered before the chat is usable -->
+  <div id="idGate" class="id-gate">
+    <form id="idGateForm" class="id-gate-card">
+      <div class="mascot" aria-hidden="true">🫁</div>
+      <h2>Welcome to Talk2Breath!</h2>
+      <p>Please ask a grown-up to type the <strong>Participant ID</strong> before we start chatting.</p>
+      <input type="text" id="participantIdInput" placeholder="Participant ID" autocomplete="off" maxlength="64" required />
+      <p id="idGateError" class="id-gate-error hidden"></p>
+      <button type="submit" id="idGateSubmit">Start Chatting 🌬️</button>
+    </form>
+  </div>
+
+  <div class="app hidden" id="appRoot">
     <header class="topbar">
       <div class="brand">
         <div class="mascot" id="mascot">🫁</div>
@@ -62,6 +74,6 @@
     <img id="lightboxImg" alt="Big picture from Breezy" />
   </div>
 
-  <script src="app.js?v=4"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

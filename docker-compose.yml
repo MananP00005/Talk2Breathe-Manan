@@ -19,6 +19,10 @@ services:
       - .env          # provides GROQ_API_KEYS (and optional model overrides)
     environment:
       - PORT=8080     # the port uvicorn listens on inside the container
+    volumes:
+      # Per-participant chat transcripts (.txt) land here on the HOST, so they survive
+      # `docker compose down`/rebuilds and you can grab them straight from ./chat_logs.
+      - ./chat_logs:/app/chat_logs
 
   # Free HTTPS via Cloudflare Quick Tunnel. Gives a public https://...trycloudflare.com
   # link (needed for the microphone to work on phones). No account/domain/cert required.

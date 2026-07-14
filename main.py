@@ -11,7 +11,10 @@ Open http://localhost:8000
 
 import base64
 import os
+import re
 import traceback
+from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, UploadFile
@@ -35,6 +38,17 @@ VISION_MODEL = os.getenv(
 # Speech-to-text (voice messages) — works in every browser, more accurate than the
 # browser's built-in recognition.
 STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+# Text-to-speech (Breezy's spoken replies) — generated server-side so voice sounds the
+# same and actually works on every tablet/browser, instead of relying on each device's
+# own (often missing or broken) speech synthesis engine.
+TTS_MODEL = os.getenv("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
+TTS_VOICE = os.getenv("GROQ_TTS_VOICE", "hannah")
+
+# Where per-participant chat transcripts get saved (mounted as a Docker volume so they
+# survive container restarts and can be pulled straight off the host).
+CHAT_LOGS_DIR = Path(os.getenv("CHAT_LOGS_DIR", "chat_logs"))
+CHAT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+PARTICIPANT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class OutOfTokens(Exception):
@@ -56,6 +70,46 @@ def get_clients():
             _clients[k] = Groq(api_key=k)
         out.append(_clients[k])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-participant session transcripts (for the research study). Every child
+# enters a participant ID before chatting; every turn is appended to that
+# participant's own .txt file with a timestamp, so re-entering the same ID
+# after a crash/closed tab continues the same transcript.
+# ---------------------------------------------------------------------------
+def clean_participant_id(participant_id: str) -> str:
+    """Validate + normalize a participant ID. Raises ValueError if invalid."""
+    pid = (participant_id or "").strip()
+    if not PARTICIPANT_ID_RE.match(pid):
+        raise ValueError(
+            "Participant ID must be 1-64 characters: letters, numbers, - or _ only."
+        )
+    return pid
+
+
+def log_path(participant_id: str) -> Path:
+    return CHAT_LOGS_DIR / f"{participant_id}.txt"
+
+
+def log_line(participant_id: str, text: str) -> None:
+    ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path(participant_id), "a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {text}\n")
+
+
+def log_turn(participant_id: str | None, role: str, text: str) -> None:
+    """Best-effort transcript logging — never let a logging problem break the chat."""
+    if not participant_id or not text:
+        return
+    try:
+        pid = clean_participant_id(participant_id)
+        speaker = "CHILD" if role == "user" else "BREEZY"
+        log_line(pid, f"{speaker}: {text}")
+    except Exception:
+        print("\n=== LOG ERROR ===")
+        traceback.print_exc()
+        print("=================\n")
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +258,15 @@ app = FastAPI(title="Talk2Breath")
 class ChatRequest(BaseModel):
     message: str
     history: list[dict] = []  # [{"role": "user"/"assistant", "content": "..."}]
+    participant_id: str = ""
+
+
+class SessionStartRequest(BaseModel):
+    participant_id: str
+
+
+class SpeakRequest(BaseModel):
+    text: str
 
 
 def _clip_history(history: list[dict], max_turns: int = 10) -> list[dict]:
@@ -264,16 +327,42 @@ def groq_transcribe(filename, raw_bytes):
     raise OutOfTokens()
 
 
+def groq_speech(text: str) -> bytes:
+    """Turn Breezy's reply into spoken audio (WAV bytes) using Groq TTS, rotating keys.
+    Generating the voice server-side means it sounds the same and actually plays on
+    every tablet/browser, instead of depending on each device's own speech engine."""
+    clients = get_clients()
+    for i, client in enumerate(clients, start=1):
+        try:
+            response = client.audio.speech.create(
+                model=TTS_MODEL,
+                voice=TTS_VOICE,
+                input=text,
+                response_format="wav",
+            )
+            return response.read()
+        except RateLimitError:
+            print(f"[rate-limited] key #{i} / TTS is out of tokens, trying next...")
+            continue
+        except AuthenticationError:
+            print(f"[bad key] key #{i} rejected — skipping.")
+            continue
+    raise OutOfTokens()
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """Text chat with Breezy."""
     try:
+        log_turn(req.participant_id, "user", req.message[:2000])
+
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages += _clip_history(req.history)
         messages.append({"role": "user", "content": req.message[:2000]})
 
         reply = groq_chat(messages)
         clean, image_url = extract_drawing(reply)
+        log_turn(req.participant_id, "assistant", clean)
         return {"reply": clean, "image_url": image_url}
     except OutOfTokens:
         return JSONResponse(
@@ -298,9 +387,11 @@ async def chat(req: ChatRequest):
 async def chat_image(
     image: UploadFile = File(...),
     message: str = Form("What is in this picture?"),
+    participant_id: str = Form(""),
 ):
     """Child uploads a photo; Breezy looks at it and responds kindly."""
     try:
+        log_turn(participant_id, "user", f"[sent a picture] {message[:1000]}")
         raw = await image.read()
         if len(raw) > 8 * 1024 * 1024:
             return JSONResponse(
@@ -323,6 +414,7 @@ async def chat_image(
         ]
         reply = groq_complete(messages, (VISION_MODEL,))
         clean, image_url = extract_drawing(reply)
+        log_turn(participant_id, "assistant", clean)
         return {"reply": clean, "image_url": image_url}
     except OutOfTokens:
         return JSONResponse(
@@ -381,6 +473,52 @@ async def transcribe(audio: UploadFile = File(...)):
             status_code=500,
             content={"error": "I couldn't hear that clearly. Please try again! 🎤",
                      "detail": str(e)},
+        )
+
+
+_EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF☀-➿]+")
+
+
+@app.post("/api/session/start")
+async def session_start(req: SessionStartRequest):
+    """Called once when a child enters their participant ID, before the chat begins.
+    Re-entering the same ID later (e.g. after the browser closed or crashed) appends
+    to that participant's existing transcript instead of starting a new one."""
+    try:
+        pid = clean_participant_id(req.participant_id)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    is_new = not log_path(pid).exists()
+    log_line(pid, "=== SESSION START ===")
+    return {"ok": True, "participant_id": pid, "new_participant": is_new}
+
+
+@app.post("/api/tts")
+async def tts(req: SpeakRequest):
+    """Turn Breezy's reply into audio server-side (Groq PlayAI TTS) so voice sounds
+    the same and reliably plays back on every tablet/browser via a plain <audio> tag,
+    instead of depending on each device's own (often missing) speech engine."""
+    try:
+        clean = _EMOJI_RE.sub("", req.text or "").strip()
+        if not clean:
+            return JSONResponse(status_code=400, content={"error": "Nothing to say."})
+        audio_bytes = groq_speech(clean[:2000])
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        return {"audio_url": f"data:audio/wav;base64,{b64}"}
+    except OutOfTokens:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Breezy's voice needs a little rest! 😴"},
+        )
+    except RuntimeError as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+    except Exception as e:
+        print("\n=== TTS ERROR ===")
+        traceback.print_exc()
+        print("==================\n")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Breezy's voice isn't working right now.", "detail": str(e)},
         )
 
 

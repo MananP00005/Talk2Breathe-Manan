@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# Participant chat transcripts — never commit real child research data.
+chat_logs/
